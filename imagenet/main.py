@@ -19,6 +19,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.utils.tensorboard import SummaryWriter
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -77,7 +78,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
-
+writer = SummaryWriter()
+counter = 0
 
 def main():
     args = parser.parse_args()
@@ -113,6 +115,8 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
+    writer.close()
+
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
@@ -137,6 +141,10 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+
+    # change model's output to 200 dimensions
+    if args.arch == 'resnet18':
+        model.fc = nn.Linear(model.fc.in_features, 200)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -213,11 +221,29 @@ def main_worker(gpu, ngpus_per_node, args):
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
+
+    val_dataset = datasets.ImageFolder(valdir, transforms.Compose([
+        transforms.ToTensor(),
+        normalize,
+    ]))
+
+    # get correct (path, label) of images in val and update them in val_dataset
+    class_to_idx = train_dataset.class_to_idx
+    fname_to_class = {}
+    for line in open(os.path.join(val_dataset.root, 'val_annotations.txt')):
+        items = line.split('\t')
+        fname_to_class[items[0]] = items[1]
+    samples = []
+    for fname in os.listdir(os.path.join(val_dataset.root, 'images')):
+        path = os.path.join(val_dataset.root, 'images', fname)
+        index = class_to_idx[fname_to_class[fname]]
+        samples.append((path, index))
+    val_dataset.samples = samples
+    val_dataset.targets = [s[1] for s in samples]
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -229,13 +255,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
+        val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
@@ -316,6 +336,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            global counter
+            counter = counter + 1
+            writer.add_scalar('Loss/train', loss.item(), counter)
+            writer.add_scalar('Accuracy/train', acc5[0], counter)
 
 
 def validate(val_loader, model, criterion, args):
@@ -355,6 +379,15 @@ def validate(val_loader, model, criterion, args):
 
             if i % args.print_freq == 0:
                 progress.display(i)
+            
+            ## output the top1 label
+            #if i == 0:
+            #    for j in range(len(output)):
+            #        out = output[j].tolist()
+            #        print(out.index(max(out)))
+
+        writer.add_scalar('Loss/val', losses.avg, counter)
+        writer.add_scalar('Accuracy/val', top5.avg, counter)
 
         progress.display_summary()
 
